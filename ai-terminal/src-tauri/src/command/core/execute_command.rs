@@ -711,7 +711,7 @@ pub fn execute_command(
                 app_handle_for_thread_state.state::<CommandManager>();
             let mut states_guard_cleanup = match command_manager_state_in_thread.commands.lock() {
                 Ok(guard) => guard,
-                Err(e) => {
+                Err(_e) => {
                     return;
                 }
             };
