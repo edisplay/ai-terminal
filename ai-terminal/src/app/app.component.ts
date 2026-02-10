@@ -1,5 +1,4 @@
 import {
-  AfterViewChecked,
   Component,
   ElementRef,
   HostListener,
@@ -11,45 +10,31 @@ import {
 import { CommonModule } from '@angular/common';
 import { invoke } from "@tauri-apps/api/core";
 import { FormsModule } from '@angular/forms';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { UnlistenFn } from '@tauri-apps/api/event';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
-
-interface CommandHistory {
-  command: string;
-  output: string[];
-  timestamp: Date;
-  isComplete: boolean;
-  isStreaming?: boolean;
-  success?: boolean;
-  expectingSshEcho?: boolean;
-}
-
-interface ChatHistory {
-  message: string;
-  response: string;
-  timestamp: Date;
-  isCommand?: boolean; // Flag to indicate if this is a command message
-  codeBlocks?: { code: string, language: string }[]; // Store extracted code blocks
-}
-
-interface TerminalSession {
-  id: string;
-  name: string;
-  commandHistory: CommandHistory[];
-  currentWorkingDirectory: string;
-  isActive: boolean;
-  gitBranch: string;
-  isSshSessionActive: boolean;
-  currentSshUserHost: string | null;
-}
+import { CommandHistory } from './models/command-history.model';
+import { ChatHistory } from './models/chat-history.model';
+import { TerminalSession } from './models/terminal-session.model';
+import { TerminalTabComponent } from './components/terminal-tab/terminal-tab.component';
+import { AiCommandService } from './services/ai-command.service';
+import { AiResponseFormatService } from './services/ai-response-format.service';
+import { OllamaConnectionService } from './services/ollama-connection.service';
+import { TerminalEventListenerService } from './services/terminal-event-listener.service';
+import { TerminalOutputService } from './services/terminal-output.service';
+import { TerminalSessionService } from './services/terminal-session.service';
+import { buildTerminalAssistantSystemPrompt } from './constants/ai.constants';
+import {
+  COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER,
+  SSH_NEEDS_PASSWORD_MARKER
+} from './constants/ssh.constants';
 
 @Component({
   selector: 'app-root',
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, TerminalTabComponent],
   templateUrl: './app.component.html',
   styleUrl: './app.component.css'
 })
-export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
+export class AppComponent implements OnInit, OnDestroy {
   // Terminal sessions
   terminalSessions: TerminalSession[] = [];
   activeSessionId: string = '';
@@ -67,6 +52,9 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   autocompleteSuggestions: string[] = [];
   showSuggestions: boolean = false;
   selectedSuggestionIndex: number = -1;
+  private readonly minAutocompleteInputLength = 2;
+  private autocompleteDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private autocompleteRequestToken: number = 0;
 
   // History search properties
   isHistorySearchActive: boolean = false;
@@ -94,7 +82,19 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   // Auto-scroll
   @ViewChild('outputArea') outputAreaRef!: ElementRef;
   @ViewChild('autocompleteContainer') autocompleteContainer!: ElementRef;
-  shouldScroll = false;
+  private _shouldScroll = false;
+  private scrollFramePending = false;
+  get shouldScroll(): boolean {
+    return this._shouldScroll;
+  }
+
+  set shouldScroll(value: boolean) {
+    this._shouldScroll = value;
+    if (value) {
+      this.scheduleScrollToBottom();
+    }
+  }
+
 
   // Cache home directory path to avoid repeated requests
   private homePath: string | null = null;
@@ -119,12 +119,17 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   showCommitPopup: boolean = false;
   commitMessage: string = '';
 
-  // Constants for SSH interaction
-  readonly SSH_NEEDS_PASSWORD_MARKER = "SSH_INTERACTIVE_PASSWORD_PROMPT_REQUESTED";
-  readonly SSH_PRE_EXEC_PASSWORD_EVENT = "ssh_pre_exec_password_request";
-  readonly COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER = "COMMAND_FORWARDED_TO_ACTIVE_SSH";
-
-  constructor(private sanitizer: DomSanitizer, private ngZone: NgZone, private elRef: ElementRef) { }
+  constructor(
+    private sanitizer: DomSanitizer,
+    private ngZone: NgZone,
+    private elRef: ElementRef,
+    private aiCommandService: AiCommandService,
+    private aiResponseFormatService: AiResponseFormatService,
+    private ollamaConnectionService: OllamaConnectionService,
+    private terminalEventListenerService: TerminalEventListenerService,
+    private terminalOutputService: TerminalOutputService,
+    private terminalSessionService: TerminalSessionService
+  ) { }
 
   getPlaceholder(): string {
     if (this.isHistorySearchActive) {
@@ -172,201 +177,174 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
 
     // Set up event listeners for command output streaming
     try {
-      // Listen for command output
-      const unlisten1 = await listen('command_output', (event) => {
-        this.ngZone.run(() => {
-          if (this.commandHistory.length > 0) {
-            const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
-            const outputLine = event.payload as string;
+      const unlisteners = await this.terminalEventListenerService.registerListeners({
+        onCommandOutput: async (outputLine: string) => {
+          this.ngZone.run(() => {
+            if (this.commandHistory.length > 0) {
+              const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
 
-            const { lineToDisplay, newExpectingSshEchoState } = this.cleanOutputLine(
-              outputLine,
-              currentCmdEntry.command,
-              this.isSshSessionActive,
-              currentCmdEntry.expectingSshEcho || false
-            );
-            currentCmdEntry.expectingSshEcho = newExpectingSshEchoState;
+              const { lineToDisplay, newExpectingSshEchoState } = this.terminalOutputService.cleanOutputLine(
+                outputLine,
+                currentCmdEntry.command,
+                this.isSshSessionActive,
+                currentCmdEntry.expectingSshEcho || false
+              );
+              currentCmdEntry.expectingSshEcho = newExpectingSshEchoState;
 
-            if (lineToDisplay === null) {
-              return; // Line was a prompt/echo/artifact and should be hidden
-            }
+              if (lineToDisplay === null) {
+                return;
+              }
 
-            // Mark command as streaming and handle initial system messages
-            if (!currentCmdEntry.isStreaming) {
-              currentCmdEntry.isStreaming = true;
-              // If the output array currently contains only a system message, clear it.
-              if (currentCmdEntry.output.length === 1 &&
-                (currentCmdEntry.output[0] === "Processing..." ||
-                  currentCmdEntry.output[0] === "Processing sudo command..." ||
-                  currentCmdEntry.output[0] === "Command started. Output will stream in real-time." ||
-                  currentCmdEntry.output[0] === "Sudo command started. Output will stream in real-time." ||
-                  currentCmdEntry.output[0] === "Command sent to active SSH session.")) {
-                currentCmdEntry.output = [];
+              if (!currentCmdEntry.isStreaming) {
+                currentCmdEntry.isStreaming = true;
+                if (
+                  currentCmdEntry.output.length === 1 &&
+                  (currentCmdEntry.output[0] === "Processing..." ||
+                    currentCmdEntry.output[0] === "Processing sudo command..." ||
+                    currentCmdEntry.output[0] === "Command started. Output will stream in real-time." ||
+                    currentCmdEntry.output[0] === "Sudo command started. Output will stream in real-time." ||
+                    currentCmdEntry.output[0] === "Command sent to active SSH session.")
+                ) {
+                  currentCmdEntry.output = [];
+                }
+              }
+
+              const skipLine =
+                lineToDisplay === "Command started. Output will stream in real-time." ||
+                lineToDisplay === "Sudo command started. Output will stream in real-time." ||
+                (currentCmdEntry.command.startsWith('sudo ') && outputLine.includes("[sudo] password for"));
+
+              if (!skipLine) {
+                currentCmdEntry.output.push(lineToDisplay);
+                this.shouldScroll = true;
               }
             }
-
-            // Skip specific system messages we don't want to display further
-            const skipLine =
-              lineToDisplay === "Command started. Output will stream in real-time." ||
-              lineToDisplay === "Sudo command started. Output will stream in real-time." ||
-              (currentCmdEntry.command.startsWith('sudo ') &&
-                outputLine.includes("[sudo] password for"));
-
-            if (!skipLine) {
-              currentCmdEntry.output.push(lineToDisplay);
+          });
+        },
+        onCommandError: async (payload: string) => {
+          this.ngZone.run(() => {
+            if (this.commandHistory.length > 0) {
+              const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
+              currentCmdEntry.output.push(payload);
               this.shouldScroll = true;
             }
-          }
-        });
-      });
+          });
+        },
+        onCommandEnd: async (payload: string) => {
+          await this.ngZone.run(async () => {
+            if (this.commandHistory.length > 0) {
+              const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
+              currentCmdEntry.isComplete = true;
+              currentCmdEntry.isStreaming = false;
 
-      // Listen for command errors
-      const unlisten2 = await listen('command_error', (event) => {
-        this.ngZone.run(() => {
-          if (this.commandHistory.length > 0) {
-            const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
-            currentCmdEntry.output.push(event.payload as string);
-            this.shouldScroll = true;
-          }
-        });
-      });
+              currentCmdEntry.success = payload === "Command completed successfully.";
 
-      // Listen for command completion
-      const unlisten3 = await listen('command_end', async (event) => {
-        await this.ngZone.run(async () => {
-          if (this.commandHistory.length > 0) {
-            const currentCmdEntry = this.commandHistory[this.commandHistory.length - 1];
-            currentCmdEntry.isComplete = true;
-            currentCmdEntry.isStreaming = false;
+              // Refresh local prompt metadata after every command, so tab title and git branch
+              // stay in sync even when commands affect cwd/branch indirectly.
+              if (!this.isSshSessionActive) {
+                await this.getCurrentDirectory();
+              }
 
-            // Set success flag based on the exit message
-            const message = event.payload as string;
-            currentCmdEntry.success = message === "Command completed successfully.";
-
-            // Handle directory updates for cd commands
-            const commandText = currentCmdEntry.command.trim();
-            const isCdCommand = commandText === 'cd' || commandText.startsWith('cd ');
-
-            // Only update for local cd. SSH cd relies on remote_directory_updated event.
-            if (isCdCommand && !this.isSshSessionActive) {
-              await this.getCurrentDirectory();
+              this.isProcessing = false;
+              this.shouldScroll = true;
             }
-
+          });
+        },
+        onCommandForwardedToSsh: async () => {
+          this.ngZone.run(() => {
             this.isProcessing = false;
+          });
+        },
+        onSshPreExecPasswordRequest: async (originalCommandFromEvent: string) => {
+          this.ngZone.run(() => {
+            const sshPromptEntry: CommandHistory = {
+              command: originalCommandFromEvent,
+              output: [`SSH Password for ${this.extractUserHostFromSshCommand(originalCommandFromEvent)}:`],
+              timestamp: new Date(),
+              isComplete: false,
+              isStreaming: false
+            };
+            this.commandHistory.push(sshPromptEntry);
+
+            this.originalSSHCommand = originalCommandFromEvent;
+            this.isSSHPasswordPrompt = true;
+            this.passwordValue = '';
+            this.displayValue = '';
+            this.currentCommand = '';
+
             this.shouldScroll = true;
-          }
-        });
-      });
-
-      // When a command is forwarded to an existing SSH session, we only get this custom event.
-      // Treat it like an immediate completion so the input textbox is re-enabled right away.
-      const unlistenSshForward = await listen('command_forwarded_to_ssh', (_event) => {
-        this.ngZone.run(() => {
-          this.isProcessing = false;
-        });
-      });
-
-      // NEW: Listen for proactive SSH password request from backend
-      const unlisten_ssh_prompt = await listen(this.SSH_PRE_EXEC_PASSWORD_EVENT, (event) => {
-        this.ngZone.run(() => {
-          const originalCommandFromEvent = event.payload as string;
-
-          // This listener is now responsible for creating the CommandHistory entry for the password prompt.
-          const sshPromptEntry: CommandHistory = {
-            command: originalCommandFromEvent, // Store the original command
-            output: [`SSH Password for ${this.extractUserHostFromSshCommand(originalCommandFromEvent)}:`],
-            timestamp: new Date(),
-            isComplete: false, // Not complete until password submitted or cancelled
-            isStreaming: false // Not streaming yet, just prompting
-          };
-          this.commandHistory.push(sshPromptEntry);
-
-          this.originalSSHCommand = originalCommandFromEvent;
-          this.isSSHPasswordPrompt = true;
-          this.passwordValue = '';
-          this.displayValue = '';
-          this.currentCommand = ''; // Clear the input field for password
-
-          this.shouldScroll = true;
-          this.isProcessing = false; // Allow password input
-          this.focusTerminalInput();
-        });
-      });
-
-      this.unlistenFunctions.push(unlisten1, unlisten2, unlisten3, unlistenSshForward, unlisten_ssh_prompt);
-
-      // Listen for remote directory updates from SSH
-      const unlistenRemoteDir = await listen('remote_directory_updated', (event) => {
-        this.ngZone.run(() => {
-          const newRemotePath = event.payload as string;
-          if (this.isSshSessionActive) {
-            if (this.currentSshUserHost) {
-              this.currentWorkingDirectory = `${this.currentSshUserHost}:${newRemotePath}`;
-            } else {
-              this.currentWorkingDirectory = newRemotePath; // Fallback
+            this.isProcessing = false;
+            this.focusTerminalInput();
+          });
+        },
+        onRemoteDirectoryUpdated: async (newRemotePath: string) => {
+          this.ngZone.run(() => {
+            if (this.isSshSessionActive) {
+              if (this.currentSshUserHost) {
+                this.currentWorkingDirectory = `${this.currentSshUserHost}:${newRemotePath}`;
+              } else {
+                this.currentWorkingDirectory = newRemotePath;
+              }
+              this.gitBranch = '';
+              this.syncActiveSessionState();
             }
-            // Git branch is not applicable for remote, ensure it's clear
+          });
+        },
+        onSshSessionStarted: async () => {
+          await this.ngZone.run(async () => {
+            this.isSshSessionActive = true;
+            await this.getCurrentDirectory();
             this.gitBranch = '';
-          }
-        });
+            this.isProcessing = false;
+          });
+        },
+        onSshSessionEnded: async () => {
+          await this.ngZone.run(async () => {
+            this.isSshSessionActive = false;
+            this.currentSshUserHost = null;
+            await this.getCurrentDirectory();
+          });
+        }
       });
-      this.unlistenFunctions.push(unlistenRemoteDir);
 
-      // Listen for SSH session start and end events
-      const unlistenSshStarted = await listen('ssh_session_started', (event) => {
-        this.ngZone.run(async () => {
-          this.isSshSessionActive = true;
-          // When SSH starts, explicitly fetch the directory, which should now be remote.
-          await this.getCurrentDirectory();
-          this.gitBranch = ''; // Clear local git branch on SSH start
-          this.isProcessing = false; // <<< Added this line to re-enable input
-        });
-      });
-      this.unlistenFunctions.push(unlistenSshStarted);
-
-      const unlistenSshEnded = await listen('ssh_session_ended', (event) => {
-        this.ngZone.run(async () => {
-          this.isSshSessionActive = false;
-          this.currentSshUserHost = null; // Clear user@host
-          // On SSH end, revert to local directory and git branch.
-          await this.getCurrentDirectory();
-        });
-      });
-      this.unlistenFunctions.push(unlistenSshEnded);
-
+      this.unlistenFunctions.push(...unlisteners);
     } catch (error) {
       console.error('Failed to set up event listeners:', error);
     }
   }
 
   ngOnDestroy() {
+    this.clearAutocompleteDebounce();
     // Clean up all event listeners
     for (const unlisten of this.unlistenFunctions) {
       unlisten();
     }
   }
 
-  ngAfterViewChecked() {
-    // Scroll to bottom if needed
-    if (this.shouldScroll && this.outputAreaRef) {
+  private scheduleScrollToBottom() {
+    if (!this.shouldScroll || this.scrollFramePending) {
+      return;
+    }
+
+    this.scrollFramePending = true;
+    requestAnimationFrame(() => {
       this.scrollToBottom();
       this.shouldScroll = false;
-    }
+      this.scrollFramePending = false;
+    });
   }
 
   scrollToBottom() {
     try {
+      if (!this.outputAreaRef?.nativeElement) {
+        return;
+      }
+
       const outputArea = this.outputAreaRef.nativeElement;
       // Force a reflow to ensure the content height is updated
       void outputArea.offsetHeight;
       // Scroll to the maximum possible position
       outputArea.scrollTop = outputArea.scrollHeight;
-
-      // Double-check the scroll position after a small delay
-      // This helps with dynamic content that might affect the scroll height
-      setTimeout(() => {
-        outputArea.scrollTop = outputArea.scrollHeight;
-      }, 50);
     } catch (err) {
       console.error('Error scrolling to bottom:', err);
     }
@@ -416,10 +394,12 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
         this.gitBranch = '';
       }
 
+      this.syncActiveSessionState();
     } catch (error) {
       console.error('Failed to get current directory:', error);
       this.currentWorkingDirectory = this.isSshSessionActive ? "remote:error" : "local:error";
       this.gitBranch = ''; // Clear git branch on error too
+      this.syncActiveSessionState();
     }
   }
 
@@ -543,6 +523,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
   }
 
   async requestAutocomplete(): Promise<void> {
+    const requestToken = ++this.autocompleteRequestToken;
     try {
       const trimmedCommand = this.currentCommand.trim();
       const isCdCommand = trimmedCommand === 'cd' || trimmedCommand.startsWith('cd ');
@@ -554,24 +535,63 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
         return;
       }
 
+      // Avoid backend autocomplete calls for very short inputs.
+      // Keep cd-related autocomplete available for directory navigation.
+      if (!isCdCommand && trimmedCommand.length < this.minAutocompleteInputLength) {
+        this.autocompleteSuggestions = [];
+        this.showSuggestions = false;
+        return;
+      }
+
       // Get autocomplete suggestions from backend
       this.autocompleteSuggestions = await invoke<string[]>("autocomplete", {
         input: this.currentCommand,
         sessionId: this.activeSessionId
       });
 
+      // Ignore stale responses from older requests.
+      if (requestToken !== this.autocompleteRequestToken) {
+        return;
+      }
+
       this.showSuggestions = this.autocompleteSuggestions.length > 0;
 
       // Reset selection index
       this.selectedSuggestionIndex = -1;
     } catch (error) {
+      // Ignore stale errors from older requests.
+      if (requestToken !== this.autocompleteRequestToken) {
+        return;
+      }
       console.error('Failed to get autocomplete suggestions:', error);
       this.autocompleteSuggestions = [];
       this.showSuggestions = false;
     }
   }
 
+  private clearAutocompleteDebounce(): void {
+    if (this.autocompleteDebounceTimer) {
+      clearTimeout(this.autocompleteDebounceTimer);
+      this.autocompleteDebounceTimer = null;
+    }
+  }
+
+  private cancelPendingAutocomplete(): void {
+    this.clearAutocompleteDebounce();
+    // Invalidate in-flight async responses from previous input states.
+    this.autocompleteRequestToken++;
+  }
+
+  private scheduleAutocomplete(): void {
+    this.clearAutocompleteDebounce();
+    this.autocompleteDebounceTimer = setTimeout(() => {
+      this.autocompleteDebounceTimer = null;
+      this.requestAutocomplete();
+    }, 200);
+  }
+
   applySuggestion(suggestion: string): void {
+    this.cancelPendingAutocomplete();
     const parts = this.currentCommand.trim().split(' ');
 
     if (parts.length > 1 || parts[0] === 'cd') {
@@ -645,6 +665,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
 
     // Hide suggestions when pressing Esc
     if (event.key === 'Escape') {
+      this.cancelPendingAutocomplete();
       this.showSuggestions = false;
       event.preventDefault();
       return;
@@ -790,6 +811,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
 
     // Execute command on Enter - only if no suggestions are visible or selected
     if (event.key === 'Enter' && !event.shiftKey && this.currentCommand.trim()) {
+      this.cancelPendingAutocomplete();
       // Skip if we're in the process of selecting a suggestion
       if (this.showSuggestions && this.selectedSuggestionIndex >= 0) {
         return;
@@ -853,14 +875,14 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
           sessionId: this.activeSessionId
         })
           .then(result => {
-            if (result === this.SSH_NEEDS_PASSWORD_MARKER) {
+            if (result === SSH_NEEDS_PASSWORD_MARKER) {
               // The 'ssh_pre_exec_password_request' event listener will handle:
               // - Creating the CommandHistory entry with the password prompt.
               // - Setting up isSSHPasswordPrompt, originalSSHCommand, etc.
               // - Setting isProcessing = false to allow password input.
               // So, no CommandHistory entry is created here for this specific case.
               // isProcessing will be set to false by the listener.
-            } else if (result === this.COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER) {
+            } else if (result === COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER) {
               // Command was forwarded to an already active SSH session.
               // Create a history entry for the command that was forwarded.
               const forwardedCommandEntry: CommandHistory = {
@@ -896,7 +918,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
               // or if it's a success that doesn't stream (less common for SSH connect),
               // isProcessing should be false. The command_end event is the primary way to set this.
               // For now, optimistically set to false if no streaming indicators.
-              if (!result || (!result.includes("Output will stream") && !result.includes(this.COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER))) {
+              if (!result || (!result.includes("Output will stream") && !result.includes(COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER))) {
                 this.isProcessing = false;
               }
               // If backend sends "Output will stream...", isProcessing remains true until command_end
@@ -967,7 +989,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
         });
 
         // If the result indicates the command was forwarded to an active SSH session
-        if (result === this.COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER) {
+        if (result === COMMAND_FORWARDED_TO_ACTIVE_SSH_MARKER) {
           this.isProcessing = false;
           // Mark that we expect the SSH shell to echo the command
           if (commandEntry) { // commandEntry is the last pushed entry
@@ -999,244 +1021,14 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
     }
   }
 
-  private stripAnsiCodes(text: string): string {
-    // Regex to remove ANSI escape codes
-    return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
-  }
-
-  private stripTerminalTitle(text: string): string {
-    // Regex to remove terminal title escape sequences like \x1b]0;...\x07
-    return text.replace(/\x1b\]0;.*\x07/g, '');
-  }
-
-  private cleanOutputLine(rawLine: string, commandText: string, isSsh: boolean, isCurrentlyExpectingEcho: boolean): { lineToDisplay: string | null, newExpectingSshEchoState: boolean } {
-    let cleanedLine = this.stripAnsiCodes(rawLine);
-    cleanedLine = this.stripTerminalTitle(cleanedLine);
-
-    let finalLineToDisplay: string | null = cleanedLine;
-    let updatedExpectingEcho = isCurrentlyExpectingEcho;
-
-    if (isSsh) {
-      const trimmedCleanedLine = cleanedLine.trim();
-      const trimmedCommandText = commandText.trim();
-
-      if (isCurrentlyExpectingEcho) {
-        // For 'cd' commands in SSH, our backend appends marker logic.
-        // The echoed line will be complex. If we see our marker, hide it.
-        if (trimmedCommandText.startsWith('cd ') && cleanedLine.includes('__REMOTE_CD_PWD_MARKER_')) {
-          finalLineToDisplay = null;
-          updatedExpectingEcho = false; // Echo handled
-          return { lineToDisplay: finalLineToDisplay, newExpectingSshEchoState: updatedExpectingEcho };
-        }
-
-        // Original echo hiding logic for other commands:
-        const commandStartIndex = trimmedCleanedLine.indexOf(trimmedCommandText);
-        if (commandStartIndex !== -1) {
-          // Consider it an echo if the command is found.
-          // More sophisticated checks could verify what comes before (prompt) and after (nothing).
-          finalLineToDisplay = null; // Hide this line
-          updatedExpectingEcho = false; // We've processed the expected echo
-          return { lineToDisplay: finalLineToDisplay, newExpectingSshEchoState: updatedExpectingEcho };
-        }
-        // If command not found on this line, but we were expecting echo, maybe it's a multi-line prompt or just a weird first line.
-        // For safety, stop expecting echo after the first line is processed when in this state.
-        // updatedExpectingEcho = false; 
-        // ^ Let's be more conservative: only stop expecting if we positively ID the echo.
-        // If the first line wasn't it, subsequent lines are definitely not the echo.
-        // However, if the first line *was* an empty line after stripping, we should still expect echo.
-        if (trimmedCleanedLine !== "") { // if it wasn't just an empty line
-          updatedExpectingEcho = false;
-        }
-
-      }
-
-      // Try to detect and hide lines that are *only* a shell prompt.
-      // Example: `pi@pi:~$ ` or `$`
-      // This regex is a basic attempt and might need refinement for different prompts.
-      const promptRegex = /^([\w\W]*?([\w.-]+@[\w.-]+(:\s?[\/\w\.~-]+)?)\s*)?([\$#%])\s*$/;
-      if (promptRegex.test(trimmedCleanedLine)) {
-        // Check if this line *only* contains the prompt and nothing else of substance
-        // For example, if `trimmedCleanedLine` is `pi@pi:~$ ` or `$`
-        // A simple check: if removing the prompt leaves an empty string.
-        const potentialPromptOnly = trimmedCleanedLine.replace(promptRegex, "").trim();
-        if (potentialPromptOnly === "") {
-          finalLineToDisplay = null; // Hide this line as it's just a prompt
-          // Don't change updatedExpectingEcho here, a prompt can appear before or after an echo.
-        }
-      }
-    }
-
-    // If, after all stripping, the line is empty, don't display it unless it was an intentional empty line from the command.
-    // However, the newline characters are preserved if the original rawLine had them, 
-    // so `cleanedLine` might be "\n" which is fine.
-    // What we want to avoid is displaying lines that become empty *after* stripping codes/prompts.
-    if (finalLineToDisplay !== null && finalLineToDisplay.trim() === "" && rawLine.trim() !== "") {
-      // It became empty after cleaning, and wasn't originally empty. Hide it.
-      // Exception: if the original line was just ANSI codes that we stripped, that's fine.
-      // This case is mostly for prompts that are stripped entirely.
-      // if (this.stripAnsiCodes(rawLine).trim() === "") {
-      // Original was just ANSI, now empty, this is an empty line effectively, display if not null already
-      // } else {
-      finalLineToDisplay = null;
-      // }
-    }
-
-    return { lineToDisplay: finalLineToDisplay, newExpectingSshEchoState: updatedExpectingEcho };
-  }
-
   // Add a new method to parse commands from AI responses
   parseCommandFromResponse(response: string): { command: string, fullText: string }[] {
-    const results: { command: string, fullText: string }[] = [];
-    let lastIndex = 0;
-
-    // First handle triple backtick blocks
-    const tripleCommandRegex = /```([^`]+)```/g;
-    let match;
-
-    while ((match = tripleCommandRegex.exec(response)) !== null) {
-      // Get the text before this command block
-      const textBefore = response.slice(lastIndex, match.index);
-
-      // Process any single backticks in the text before
-      if (textBefore) {
-        const processedText = this.processSingleBackticks(textBefore);
-        if (processedText) {
-          results.push({
-            command: '',
-            fullText: processedText
-          });
-        }
-      }
-
-      // Add the command with its backticks
-      results.push({
-        command: match[1].trim(),
-        fullText: match[0] // Include the full match with backticks
-      });
-
-      lastIndex = match.index + match[0].length;
-
-      // Check if there's an escaped newline (\\n) after this command
-      const nextChars = response.slice(lastIndex, lastIndex + 4);
-      if (nextChars === '\\n') {
-        results.push({
-          command: '',
-          fullText: '\n'
-        });
-        lastIndex += 4; // Skip the \\n
-      }
-    }
-
-    // Process any remaining text for single backticks
-    const textAfter = response.slice(lastIndex);
-    if (textAfter) {
-      const processedText = this.processSingleBackticks(textAfter);
-      if (processedText) {
-        results.push({
-          command: '',
-          fullText: processedText
-        });
-      }
-    }
-
-    return results;
-  }
-
-  // Helper method to process single backticks into bold text
-  private processSingleBackticks(text: string): string {
-    // Replace single backticks with bold markers and sanitize
-    const processed = text.replace(/`([^`]+)`/g, '<b>$1</b>');
-    return processed;
+    return this.aiResponseFormatService.parseCommandFromResponse(response);
   }
 
   // Extract code blocks from response text
   extractCodeBlocks(text: string): { formattedText: string, codeBlocks: { code: string, language: string }[] } {
-    const codeBlocks: { code: string, language: string }[] = [];
-
-    // Special handling for command responses (single line enclosed in triple backticks)
-    const commandParts = this.parseCommandFromResponse(text);
-    if (commandParts.length > 0) {
-      // Build the formatted text with placeholders and collect code blocks
-      const formattedParts = commandParts.map((part) => {
-        if (part.command) {
-          // This is a command block
-          codeBlocks.push({
-            code: part.command,
-            language: 'command'
-          });
-          return `<code-block-${codeBlocks.length - 1}></code-block-${codeBlocks.length - 1}>`;
-        } else {
-          // This is regular text
-          return part.fullText;
-        }
-      });
-
-      // Join with newlines to preserve the model's formatting
-      return {
-        formattedText: formattedParts.join(''),
-        codeBlocks
-      };
-    }
-
-    // First, check if the entire response is just a single code block with backticks
-    if (text.trim().startsWith('```') && text.trim().endsWith('```')) {
-      const trimmedText = text.trim();
-      // Check if there's any content inside the backticks
-      const content = trimmedText.slice(3, -3).trim();
-      if (content) {
-        // Check if the first line might be a language identifier
-        const lines = content.split('\n');
-        let code: string;
-        let language: string = 'text';
-
-        if (lines.length > 1 && !lines[0].includes(' ') && lines[0].length < 20) {
-          // First line might be a language identifier
-          language = lines[0];
-          code = lines.slice(1).join('\n').trim();
-        } else {
-          // No language identifier
-          code = content;
-        }
-
-        codeBlocks.push({ code, language });
-        return { formattedText: `<code-block-0></code-block-0>`, codeBlocks };
-      }
-    }
-
-    // If this is a very short response (e.g., just a command), treat it as a command
-    if (text.length < 100 && !text.includes('\n') && !text.includes('```')) {
-      codeBlocks.push({
-        code: text.trim(),
-        language: 'command'
-      });
-
-      return { formattedText: `<code-block-0></code-block-0>`, codeBlocks };
-    }
-
-    // If not a single block, use regex to find all occurrences of text between triple backticks
-    // This regex handles the triple backtick pattern with optional language identifier
-    const codeBlockRegex = /```([\w-]*)?(?:\s*\n)?([\s\S]*?)```/gm;
-
-    // Replace code blocks with placeholders while storing extracted code
-    let formattedText = text.replace(codeBlockRegex, (language, code) => {
-      // Skip empty matches
-      if (!code || !code.trim()) {
-        return '';
-      }
-
-      const trimmedCode = code.trim();
-      const index = codeBlocks.length;
-
-      codeBlocks.push({
-        code: trimmedCode,
-        language: language ? language.trim() : 'text'
-      });
-
-      // Return a placeholder that won't be confused with actual content
-      return `<code-block-${index}></code-block-${index}>`;
-    });
-
-    return { formattedText, codeBlocks };
+    return this.aiResponseFormatService.extractCodeBlocks(text);
   }
 
   // Handle code copy button click
@@ -1268,42 +1060,7 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
 
   // Check if a code block is a simple command (no special formatting needed)
   isSimpleCommand(code: string): boolean {
-    if (!code) return false;
-
-    // Clean the code first by removing any backticks
-    const cleanCode = code.replace(/```/g, '').trim();
-
-    // For commands extracted by parseCommandFromResponse, we always return true
-    // if they're relatively short and simple
-    if (cleanCode.length < 100 && !cleanCode.includes('\n')) {
-      // Check if it has common terminal command patterns
-      if (cleanCode.split(' ').length <= 5) {
-        return true;
-      }
-    }
-
-    // A simple command is a single line terminal command that doesn't need
-    // a full code block for display
-    const isSimple = !cleanCode.includes('\n') &&
-      !cleanCode.includes('|') &&
-      !cleanCode.includes('>') &&
-      !cleanCode.includes('<') &&
-      !cleanCode.includes('=') &&
-      cleanCode.length < 80;
-
-    // Specific check for common commands
-    const isCommonCommand = cleanCode.startsWith('ls') ||
-      cleanCode.startsWith('cd') ||
-      cleanCode.startsWith('mkdir') ||
-      cleanCode.startsWith('rm') ||
-      cleanCode.startsWith('cp') ||
-      cleanCode.startsWith('mv') ||
-      cleanCode.startsWith('cat') ||
-      cleanCode.startsWith('grep') ||
-      cleanCode.startsWith('find') ||
-      cleanCode.startsWith('echo');
-
-    return isSimple && (isCommonCommand || cleanCode.split(' ').length <= 3);
+    return this.aiResponseFormatService.isSimpleCommand(code);
   }
 
   // Helper method to directly call Ollama API from frontend
@@ -1311,45 +1068,9 @@ export class AppComponent implements OnInit, AfterViewChecked, OnDestroy {
     try {
       // Get the current operating system
       const os = navigator.platform.toLowerCase().includes('mac') ?
-        'macOS' : navigator.platform.toLowerCase().includes('win') ?
-          'Windows' : 'Linux';
+        'macOS' : 'Linux';
 
-      // Create a system prompt that includes OS information and formatting instructions
-      const systemPrompt = `You are a helpful terminal assistant. The user is using a ${os} operating system. 
-When providing terminal commands, you MUST follow this EXACT format without any deviations:
-
-CRITICAL FORMAT RULES:
-1. Each command block must be on ONE LINE ONLY - NO NEWLINES INSIDE COMMAND BLOCKS
-2. Each command must be followed by a colon and a space, then the explanation
-3. Use exactly three backticks to wrap each command
-4. Put each command-explanation pair on its own line using \\n
-5. NEVER include language identifiers (like 'bash')
-6. NEVER include newlines or line breaks inside the command blocks
-
-Examples of INCORRECT format:
-❌ \`\`\`ls
-\`\`\` : Lists files (NO NEWLINES IN COMMAND)
-❌ \`\`\`bash ls\`\`\` : Lists files (NO LANGUAGE IDENTIFIERS)
-❌ \`\`\`ls\`\`\` Lists files (MISSING COLON)
-❌ \`\`\`ls -la\`\`\`
-   : Lists all files (NO SEPARATE LINES)
-
-Your response must look EXACTLY like the correct format above, with:
-- One command per line or if you need to run multiple commands together, put them on the same line separated by a & symbol
-- No newlines within command blocks
-- A colon and space after each command block
-- A brief explanation after the colon
-- Use the html new line character to separate each command-explanation pair, do not use any other newline method
-
-Example of CORRECT format:
-\`\`\`ls\`\`\` : Lists files in current directory \`\`\`pwd && ls\`\`\` : Shows current directory path and lists files\`\`\`cd Documents\`\`\` : Changes to Documents directory
-
-IMPORTANT RULES:
-1. NEVER use 'bash' or any other language identifier
-2. NEVER include backticks within the command itself
-3. ALWAYS put each command on a new line using the html new line character
-4. ALWAYS use exactly three backticks (\`\`\`) around each command
-5. ALWAYS follow each command with : and a brief explanation`;
+      const systemPrompt = buildTerminalAssistantSystemPrompt(os);
 
       // Combine the system prompt with the user's question
       const combinedPrompt = `${systemPrompt}\n\nUser: ${question}`;
@@ -1374,7 +1095,6 @@ IMPORTANT RULES:
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error(`Ollama API error (${response.status}):`, errorText);
         throw new Error(`Ollama API error: ${response.status} - ${errorText}`);
       }
 
@@ -1489,166 +1209,42 @@ IMPORTANT RULES:
 
   // Code specific functions
   isCodeBlockPlaceholder(text: string): boolean {
-    // Check for exact match of <code-block-N> format
-    const exactMatch = /^<code-block-\d+><\/code-block-\d+>$/.test(text);
-
-    if (exactMatch) {
-      return true;
-    }
-
-    // More flexible check for variations of the format
-    return text.trim().startsWith('<code-block-') && text.trim().includes('>');
+    return this.aiResponseFormatService.isCodeBlockPlaceholder(text);
   }
 
   getCodeBlockIndex(placeholder: string): number {
-    // First try to match the full placeholder with opening and closing tags
-    let match = placeholder.match(/<code-block-(\d+)><\/code-block-\d+>/);
-
-    // If that doesn't work, try a more flexible approach for partial matches
-    if (!match) {
-      match = placeholder.match(/<code-block-(\d+)>/);
-    }
-
-    return match ? parseInt(match[1]) : -1;
+    return this.aiResponseFormatService.getCodeBlockIndex(placeholder);
   }
 
   // Handle AI commands starting with /
   async handleAICommand(command: string): Promise<string> {
-    const parts = command.split(' ');
-    const cmd = parts[0].toLowerCase();
-
-    switch (cmd) {
-      case '/help':
-        return `
-Available commands:
-/help - Show this help message
-/models - List available models
-/model [name] - Show current model or switch to a different model
-/host [url] - Show current API host or set a new one
-/retry - Retry connection to Ollama API
-/clear - Clear the AI chat history`;
-
-      case '/models':
-        try {
-          // Get list of models directly from Ollama API
-          const response = await fetch(`${this.ollamaApiHost}/api/tags`);
-
-          if (!response.ok) {
-            throw new Error(`Ollama API error: ${response.status}`);
-          }
-
-          const data = await response.json();
-
-          // Format the response
-          let result = 'Available models:\n';
-          for (const model of data.models) {
-            result += `- ${model.name} (${model.size} bytes)\n`;
-          }
-          return result;
-        } catch (error) {
-          return `Error: Failed to get models from Ollama API: ${error}`;
-        }
-
-      case '/model':
-        if (parts.length > 1) {
-          const modelName = parts[1];
-          try {
-            // Just update the model locally - no need to call backend
-            this.currentLLMModel = modelName;
-            return `Switched to model: ${modelName}`;
-          } catch (error) {
-            return `Error: Failed to switch model: ${error}`;
-          }
-        } else {
-          return `Current model: ${this.currentLLMModel}`;
-        }
-
-      case '/host':
-        if (parts.length > 1) {
-          const hostUrl = parts.slice(1).join(' ');
-          try {
-            // Update API host locally
-            this.ollamaApiHost = hostUrl;
-            // Test the connection with the new host
-            setTimeout(() => this.testOllamaConnection(), 100);
-            return `Changed Ollama API host to: ${hostUrl}`;
-          } catch (error) {
-            return `Error: Failed to set host: ${error}`;
-          }
-        } else {
-          return `Current Ollama API host: ${this.ollamaApiHost}`;
-        }
-
-      case '/retry':
-        // Retry connection and return a message
-        setTimeout(() => this.retryOllamaConnection(), 100);
-        return `Attempting to reconnect to Ollama API...`;
-
-      case '/clear':
-        // Clear the chat history
+    return this.aiCommandService.handleAICommand(command, {
+      currentLLMModel: this.currentLLMModel,
+      ollamaApiHost: this.ollamaApiHost,
+      setCurrentLLMModel: (model: string) => {
+        this.currentLLMModel = model;
+      },
+      setOllamaApiHost: (host: string) => {
+        this.ollamaApiHost = host;
+      },
+      clearChatHistory: () => {
         this.chatHistory = [];
-        return `AI chat history cleared`;
-
-      default:
-        return `Unknown command: ${cmd}. Type /help for available commands.`;
-    }
-  }
-
-  // Get the original unprocessed response for copying
-  getOriginalResponse(entry: ChatHistory): string {
-    // If there are no code blocks, just return the response
-    if (!entry.codeBlocks || entry.codeBlocks.length === 0) {
-      return entry.response;
-    }
-
-    // Otherwise reconstruct the original response by replacing placeholders with code only (no backticks)
-    let originalResponse = entry.response;
-    for (let i = 0; i < entry.codeBlocks.length; i++) {
-      const placeholder = `<code-block-${i}></code-block-${i}>`;
-
-      // Just use the code without any backticks or formatting
-      originalResponse = originalResponse.replace(placeholder, entry.codeBlocks[i].code);
-    }
-
-    return originalResponse;
-  }
-
-  // Copy the full response including code blocks
-  copyFullResponse(entry: ChatHistory): void {
-    this.copyToClipboard(this.getOriginalResponse(entry));
-    this.showCopiedNotification();
+      },
+      testOllamaConnection: () => {
+        void this.testOllamaConnection();
+      },
+      retryOllamaConnection: async () => this.retryOllamaConnection()
+    });
   }
 
   // Method to get command explanation from code block
   getCommandExplanation(code: string): string | null {
-    if (!code) return null;
-
-    // Split by colon to separate command from explanation
-    const parts = code.split(':');
-
-    // If there's more than one part and the second part isn't empty
-    if (parts.length > 1 && parts[1].trim()) {
-      // Return everything after the first colon
-      return parts.slice(1).join(':').trim();
-    }
-
-    return null;
+    return this.aiResponseFormatService.getCommandExplanation(code);
   }
 
   // Update transformCodeForDisplay to handle explanations
   transformCodeForDisplay(code: string): string {
-    if (!code) return '';
-
-    // Remove any backticks
-    let cleanCode = code.replace(/```/g, '').trim();
-
-    // If there's a colon, only show the command part
-    const colonIndex = cleanCode.indexOf(':');
-    if (colonIndex > -1) {
-      cleanCode = cleanCode.substring(0, colonIndex).trim();
-    }
-
-    return cleanCode;
+    return this.aiResponseFormatService.transformCodeForDisplay(code);
   }
 
   // Make sure all code blocks in the chat history are properly sanitized
@@ -1701,11 +1297,11 @@ Available commands:
 
     // When not processing, fetch suggestions
     if (!this.isProcessing) {
-      this.requestAutocomplete();
+      this.scheduleAutocomplete();
     }
 
     // Trigger scroll to bottom when typing
-    this.shouldScroll = true;
+      this.shouldScroll = true;
   }
 
   // Handle click on suggestion
@@ -1928,128 +1524,44 @@ Available commands:
 
   // Test the Ollama connection
   async testOllamaConnection(): Promise<void> {
-    try {
-      // Try to fetch the list of models to test the connection
-      const response = await fetch(`${this.ollamaApiHost}/api/tags`, {
-        method: 'GET'
-      });
-
-      if (response.ok) {
-        // We could also pre-populate the model list here
-        const data = await response.json();
-        if (data && data.models && data.models.length > 0) {
-          const availableModels = data.models.map((m: any) => m.name).join(', ');
-
-          // Set default model to the first available model if our default isn't in the list
-          const modelExists = data.models.some((m: any) => m.name === this.currentLLMModel);
-          if (!modelExists && data.models.length > 0) {
-            this.currentLLMModel = data.models[0].name;
-
-            // Notify in chat history
-            this.chatHistory.push({
-              message: " System",
-              response: `Connected to Ollama API. Available models: ${availableModels}
-Using: ${this.currentLLMModel}`,
-              timestamp: new Date(),
-              isCommand: true
-            });
-          } else if (modelExists) {
-            // If our model exists, just show success
-            this.chatHistory.push({
-              message: " System",
-              response: `Connected to Ollama API. Using model: ${this.currentLLMModel}`,
-              timestamp: new Date(),
-              isCommand: true
-            });
-          }
-        } else {
-          // Ollama is running but no models are available
-          this.chatHistory.push({
-            message: "System",
-            response: `Connected to Ollama API, but no models are available. Please install models with \"ollama pull <model>\".`,
-            timestamp: new Date(),
-            isCommand: true
-          });
-        }
-      } else {
-        console.error('Ollama connection test failed:', response.status);
-        // Add to chat history a message about Ollama not being available
-        this.chatHistory.push({
-          message: "System",
-          response: "Could not connect to Ollama API. Please make sure Ollama is running on " +
-            this.ollamaApiHost + " or change the host using /host command.",
-          timestamp: new Date(),
-          isCommand: true
-        });
+    await this.ollamaConnectionService.testOllamaConnection({
+      ollamaApiHost: this.ollamaApiHost,
+      currentLLMModel: this.currentLLMModel,
+      setCurrentLLMModel: (model: string) => {
+        this.currentLLMModel = model;
+      },
+      addChatEntry: (entry: ChatHistory) => {
+        this.chatHistory.push(entry);
       }
-    } catch (error) {
-      console.error('Error testing Ollama connection:', error);
-      // Add to chat history a message about Ollama not being available
-      this.chatHistory.push({
-        message: "System",
-        response: "Could not connect to Ollama API. Please make sure Ollama is running on " +
-          this.ollamaApiHost + " or change the host using /host command.",
-        timestamp: new Date(),
-        isCommand: true
-      });
-    }
+    });
   }
 
   // Method to retry Ollama connection
   async retryOllamaConnection(): Promise<void> {
-    this.chatHistory.push({
-      message: "System",
-      response: "🔄 Retrying connection to Ollama API...",
-      timestamp: new Date(),
-      isCommand: true
+    await this.ollamaConnectionService.retryOllamaConnection({
+      ollamaApiHost: this.ollamaApiHost,
+      currentLLMModel: this.currentLLMModel,
+      setCurrentLLMModel: (model: string) => {
+        this.currentLLMModel = model;
+      },
+      addChatEntry: (entry: ChatHistory) => {
+        this.chatHistory.push(entry);
+      }
     });
-    await this.testOllamaConnection();
   }
 
   // Check if a specific model exists in Ollama
   async checkModelExists(modelName: string): Promise<boolean> {
-    try {
-      // Try to fetch the list of models
-      const response = await fetch(`${this.ollamaApiHost}/api/tags`, {
-        method: 'GET'
-      });
-
-      if (!response.ok) {
-        console.error(`Failed to get models: ${response.status}`);
-        return false;
+    return this.ollamaConnectionService.checkModelExists(modelName, {
+      ollamaApiHost: this.ollamaApiHost,
+      currentLLMModel: this.currentLLMModel,
+      setCurrentLLMModel: (model: string) => {
+        this.currentLLMModel = model;
+      },
+      addChatEntry: (entry: ChatHistory) => {
+        this.chatHistory.push(entry);
       }
-
-      const data = await response.json();
-
-      if (!data.models || !Array.isArray(data.models)) {
-        console.error('Unexpected response format when checking models:', data);
-        return false;
-      }
-
-      const modelExists = data.models.some((m: any) => m.name === modelName);
-
-      if (!modelExists) {
-
-        // If model doesn't exist, automatically switch to the first available model
-        if (data.models.length > 0) {
-          this.currentLLMModel = data.models[0].name;
-
-          // Notify in chat
-          this.chatHistory.push({
-            message: "System",
-            response: `ℹModel '${modelName}' not found. Automatically switched to '${this.currentLLMModel}'.`,
-            timestamp: new Date(),
-            isCommand: true
-          });
-
-          return true; // Return true since we've fixed the issue by switching
-        }
-      }
-
-      return modelExists;
-    } catch (error: any) {
-      return false;
-    }
+    });
   }
 
   // Method to copy code to terminal input
@@ -2101,22 +1613,6 @@ Using: ${this.currentLLMModel}`,
     }
   }
 
-  // Method to scroll to top of a command output block
-  scrollToTop(entry: CommandHistory): void {
-    const element = document.querySelector(`[data-command-id="${entry.timestamp.getTime()}"]`);
-    if (element) {
-      element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  }
-
-  // Method to scroll to end of a command output block
-  scrollToEnd(entry: CommandHistory): void {
-    const element = document.querySelector(`[data-command-id="${entry.timestamp.getTime()}"]`);
-    if (element) {
-      element.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    }
-  }
-
   // Helper to extract user@host from ssh command for a nicer prompt
   extractUserHostFromSshCommand(sshCommand: string): string {
     const parts = sshCommand.trim().split(/\\s+/);
@@ -2135,23 +1631,14 @@ Using: ${this.currentLLMModel}`,
 
   // Session Management Methods
   createNewSession(name?: string, setAsActive: boolean = false): string {
-    const sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const sessionName = name || `Terminal ${this.terminalSessions.length + 1}`;
+    const { sessions, sessionId, shouldActivate } = this.terminalSessionService.createNewSession(
+      this.terminalSessions,
+      name,
+      setAsActive
+    );
+    this.terminalSessions = sessions;
 
-    const newSession: TerminalSession = {
-      id: sessionId,
-      name: sessionName,
-      commandHistory: [],
-      currentWorkingDirectory: '~',
-      isActive: setAsActive,
-      gitBranch: '',
-      isSshSessionActive: false,
-      currentSshUserHost: null
-    };
-
-    this.terminalSessions.push(newSession);
-
-    if (setAsActive || this.terminalSessions.length === 1) {
+    if (shouldActivate) {
       this.switchToSession(sessionId);
     }
 
@@ -2164,17 +1651,16 @@ Using: ${this.currentLLMModel}`,
       this.saveCurrentSessionState();
     }
 
-    // Find and activate new session
-    const targetSession = this.terminalSessions.find(s => s.id === sessionId);
+    const { sessions, targetSession } = this.terminalSessionService.switchToSession(
+      this.terminalSessions,
+      sessionId
+    );
+    this.terminalSessions = sessions;
+
     if (!targetSession) {
       return;
     }
 
-    // Mark all sessions as inactive
-    this.terminalSessions.forEach(session => session.isActive = false);
-
-    // Activate target session
-    targetSession.isActive = true;
     this.activeSessionId = sessionId;
 
     // Restore session state
@@ -2182,58 +1668,69 @@ Using: ${this.currentLLMModel}`,
   }
 
   closeSession(sessionId: string): void {
-    // Prevent closing the last session
-    if (this.terminalSessions.length <= 1) {
-      return;
-    }
+    const { sessions, nextActiveSessionId } = this.terminalSessionService.closeSession(
+      this.terminalSessions,
+      sessionId
+    );
+    this.terminalSessions = sessions;
 
-    const sessionIndex = this.terminalSessions.findIndex(s => s.id === sessionId);
-    if (sessionIndex === -1) {
-      return;
-    }
-
-    const wasActive = this.terminalSessions[sessionIndex].isActive;
-
-    // Remove the session
-    this.terminalSessions.splice(sessionIndex, 1);
-
-    // If we closed the active session, switch to another one
-    if (wasActive) {
-      // Switch to the session before the closed one, or the first one if we closed the first
-      const newActiveIndex = Math.max(0, sessionIndex - 1);
-      this.switchToSession(this.terminalSessions[newActiveIndex].id);
+    if (nextActiveSessionId) {
+      this.switchToSession(nextActiveSessionId);
     }
   }
 
   renameSession(sessionId: string, newName: string): void {
-    const session = this.terminalSessions.find(s => s.id === sessionId);
-    if (session && newName.trim()) {
-      session.name = newName.trim();
-    }
+    this.terminalSessions = this.terminalSessionService.renameSession(
+      this.terminalSessions,
+      sessionId,
+      newName
+    );
   }
 
   private saveCurrentSessionState(): void {
-    const activeSession = this.terminalSessions.find(s => s.id === this.activeSessionId);
-    if (activeSession) {
-      // Exit history search mode before saving state
-      if (this.isHistorySearchActive) {
-        this.exitHistorySearch(false);
-      }
-
-      activeSession.commandHistory = [...this.commandHistory];
-      activeSession.currentWorkingDirectory = this.currentWorkingDirectory;
-      activeSession.gitBranch = this.gitBranch;
-      activeSession.isSshSessionActive = this.isSshSessionActive;
-      activeSession.currentSshUserHost = this.currentSshUserHost;
+    // Exit history search mode before saving state
+    if (this.isHistorySearchActive) {
+      this.exitHistorySearch(false);
     }
+
+    this.terminalSessions = this.terminalSessionService.saveCurrentSessionState(
+      this.terminalSessions,
+      this.activeSessionId,
+      {
+        commandHistory: this.commandHistory,
+        currentWorkingDirectory: this.currentWorkingDirectory,
+        gitBranch: this.gitBranch,
+        isSshSessionActive: this.isSshSessionActive,
+        currentSshUserHost: this.currentSshUserHost
+      }
+    );
+  }
+
+  private syncActiveSessionState(): void {
+    if (!this.activeSessionId) {
+      return;
+    }
+
+    this.terminalSessions = this.terminalSessionService.saveCurrentSessionState(
+      this.terminalSessions,
+      this.activeSessionId,
+      {
+        commandHistory: this.commandHistory,
+        currentWorkingDirectory: this.currentWorkingDirectory,
+        gitBranch: this.gitBranch,
+        isSshSessionActive: this.isSshSessionActive,
+        currentSshUserHost: this.currentSshUserHost
+      }
+    );
   }
 
   private restoreSessionState(session: TerminalSession): void {
-    this.commandHistory = [...session.commandHistory];
-    this.currentWorkingDirectory = session.currentWorkingDirectory;
-    this.gitBranch = session.gitBranch;
-    this.isSshSessionActive = session.isSshSessionActive;
-    this.currentSshUserHost = session.currentSshUserHost;
+    const state = this.terminalSessionService.restoreSessionState(session);
+    this.commandHistory = state.commandHistory;
+    this.currentWorkingDirectory = state.currentWorkingDirectory;
+    this.gitBranch = state.gitBranch;
+    this.isSshSessionActive = state.isSshSessionActive;
+    this.currentSshUserHost = state.currentSshUserHost;
 
     // Reset UI state
     this.currentCommand = '';
@@ -2246,7 +1743,7 @@ Using: ${this.currentLLMModel}`,
   }
 
   getActiveSession(): TerminalSession | undefined {
-    return this.terminalSessions.find(s => s.id === this.activeSessionId);
+    return this.terminalSessionService.getActiveSession(this.terminalSessions, this.activeSessionId);
   }
 
   // Event handlers for tab renaming
@@ -2265,7 +1762,8 @@ Using: ${this.currentLLMModel}`,
       const newName = target.textContent?.trim() || session.name;
       this.renameSession(session.id, newName);
       // Restore the display text in case textContent was modified
-      target.textContent = session.name;
+      const renamedSession = this.terminalSessions.find((s) => s.id === session.id);
+      target.textContent = renamedSession?.name || session.name;
     }
   }
 
@@ -2276,5 +1774,29 @@ Using: ${this.currentLLMModel}`,
       target.blur();
       keyboardEvent.preventDefault();
     }
+  }
+
+  trackBySessionId(_: number, session: TerminalSession): string {
+    return session.id;
+  }
+
+  trackByCommandEntry(_: number, entry: CommandHistory): number {
+    return entry.timestamp.getTime();
+  }
+
+  trackByOutputLine(index: number, line: string): string {
+    return `${index}-${line}`;
+  }
+
+  trackByAutocompleteSuggestion(index: number, suggestion: string): string {
+    return `${index}-${suggestion}`;
+  }
+
+  trackByChatEntry(index: number, entry: ChatHistory): string {
+    return `${entry.timestamp.getTime()}-${index}`;
+  }
+
+  trackByResponseSegment(index: number, segment: string): string {
+    return `${index}-${segment}`;
   }
 }
