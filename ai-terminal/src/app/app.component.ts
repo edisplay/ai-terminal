@@ -18,6 +18,7 @@ import { CommandHistory } from './models/command-history.model';
 import { ChatHistory } from './models/chat-history.model';
 import { TerminalSession } from './models/terminal-session.model';
 import { TerminalTabComponent } from './components/terminal-tab/terminal-tab.component';
+import { IconComponent } from './components/icon/icon.component';
 import { AiCommandService } from './services/ai-command.service';
 import { AiResponseFormatService } from './services/ai-response-format.service';
 import { OllamaConnectionService } from './services/ollama-connection.service';
@@ -26,7 +27,7 @@ import { buildTerminalAssistantSystemPrompt } from './constants/ai.constants';
 
 @Component({
   selector: 'app-root',
-  imports: [CommonModule, FormsModule, TerminalTabComponent],
+  imports: [CommonModule, FormsModule, TerminalTabComponent, IconComponent],
   templateUrl: './app.component.html',
   styleUrl: './app.component.css'
 })
@@ -423,6 +424,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   // Helper method to directly call Ollama API from frontend
+  // Includes chat history and last 4 terminal commands for better context
   async callOllamaDirectly(question: string, model: string): Promise<string> {
     try {
       // Get the current operating system
@@ -431,19 +433,58 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       const systemPrompt = buildTerminalAssistantSystemPrompt(os);
 
-      // Combine the system prompt with the user's question
-      const combinedPrompt = `${systemPrompt}\n\nUser: ${question}`;
+      // Build messages array for /api/chat (includes conversation context)
+      const messages: { role: string; content: string }[] = [
+        { role: 'system', content: systemPrompt }
+      ];
+
+      // Add previous chat history (exclude the current pending "Thinking..." entry)
+      const completedChatHistory = this.chatHistory.slice(0, -1);
+      for (const entry of completedChatHistory) {
+        if (entry.response && entry.response !== 'Thinking...') {
+          messages.push({ role: 'user', content: entry.message });
+          messages.push({ role: 'assistant', content: entry.response });
+        }
+      }
+
+      // Get current folder (try backend for fresher value, fallback to session state)
+      let currentFolder = this.currentWorkingDirectory || '~';
+      if (this.activeSessionId) {
+        try {
+          const cwd = await invoke<string>('get_working_directory', {
+            sessionId: this.activeSessionId
+          });
+          if (cwd?.trim()) {
+            currentFolder = cwd;
+          }
+        } catch {
+          // Keep currentWorkingDirectory fallback
+        }
+      }
+
+      // Build the current user message with context (folder, commands, question)
+      const contextParts: string[] = [];
+      contextParts.push(`Current folder: ${currentFolder}`);
+      const lastCommands = this.commandHistory
+        .filter(c => c.command?.trim())
+        .slice(-4)
+        .map(c => c.command.trim());
+      if (lastCommands.length > 0) {
+        contextParts.push(`Recent terminal commands (last ${lastCommands.length}):\n${lastCommands.map(c => `  $ ${c}`).join('\n')}`);
+      }
+      contextParts.push(`Current question: ${question}`);
+      const userContent = contextParts.join('\n\n');
+      messages.push({ role: 'user', content: userContent });
 
       const requestBody = {
         model: model,
-        prompt: combinedPrompt,
+        messages,
         stream: false
       };
 
-      // Use relative path with proxy instead of absolute URL
-      const apiEndpoint = this.useProxy ? '/api/generate' : `${this.ollamaApiHost}/api/generate`;
+      // Use /api/chat endpoint for proper conversation context
+      const apiEndpoint = this.useProxy ? '/api/chat' : `${this.ollamaApiHost}/api/chat`;
 
-      // Call Ollama directly
       const response = await fetch(apiEndpoint, {
         method: 'POST',
         headers: {
@@ -459,12 +500,14 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
       const data = await response.json();
 
-      if (!data.response) {
+      // /api/chat returns message.content (not response)
+      const content = data.message?.content ?? data.response;
+      if (!content) {
         console.error('Unexpected response format:', data);
         return 'Error: Unexpected response format from Ollama';
       }
 
-      return data.response;
+      return content;
     } catch (error: any) {
 
       // Add more specific error messages for different failure types
@@ -673,9 +716,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  // Method to copy code to terminal input
+  // Method to copy code to terminal input (adds to prompt for editing, does not execute)
   sendCodeToTerminal(code: string): void {
-    const command = `${this.transformCodeForDisplay(code)}\n`;
+    const command = this.transformCodeForDisplay(code);
     if (this.activeSessionId) {
       invoke<void>('pty_write', { sessionId: this.activeSessionId, data: command }).catch((error) => {
         console.error('Failed to send command to PTY:', error);
@@ -703,16 +746,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
   // Method to execute code directly
   executeCodeDirectly(code: string): void {
-    const command = `${this.transformCodeForDisplay(code)}\n`;
+    const command = this.transformCodeForDisplay(code);
+    const commandWithNewline = `${command}\n`;
     if (this.activeSessionId) {
-      invoke<void>('pty_write', { sessionId: this.activeSessionId, data: command }).catch((error) => {
+      invoke<void>('pty_write', { sessionId: this.activeSessionId, data: commandWithNewline }).catch((error) => {
         console.error('Failed to execute command in PTY:', error);
+      });
+      // Track command in history for LLM context
+      this.commandHistory.push({
+        command,
+        output: [],
+        timestamp: new Date(),
+        isComplete: true
       });
     }
 
     // Toggle to the terminal panel if we're on mobile
     if (window.innerWidth < 768) {
       this.isAIPanelVisible = false;
+    }
+  }
+
+  toggleAIPanel(): void {
+    this.isAIPanelVisible = !this.isAIPanelVisible;
+    if (this.terminal && this.fitAddon) {
+      setTimeout(() => this.fitAddon!.fit(), 0);
     }
   }
 

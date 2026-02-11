@@ -106,6 +106,29 @@
   background: rgba(122, 162, 247, 0.08);
 }
 
+.ai-panel-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: auto;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.ai-panel-toggle:hover {
+  border-color: rgba(122, 162, 247, 0.45);
+  color: var(--accent);
+  background: rgba(122, 162, 247, 0.08);
+}
+
 .output-area {
   flex: 1;
   overflow-y: auto;
@@ -219,13 +242,12 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  min-height: 72px;
-  margin: 0;
-  border-top-left-radius: 10px;
-  border-top-right-radius: 10px;
+  min-height: 32px;
+  margin: 8px ;
+  border-radius: 10px;
   padding: 8px 8px 10px;
-  border-top: 1px solid var(--border-subtle);
-  background: var(--bg-1);
+  border: 1px solid var(--border-subtle);
+  background: #1a202c;
 }
 
 .current-directory {
@@ -347,7 +369,7 @@
 }
 
 .chat-entry {
-  margin: 10px;
+  margin: 16px 10px;
   padding: 10px 12px;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
@@ -437,24 +459,21 @@
   border: none;
   border-radius: 4px;
   background: none;
-  color: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   opacity: 0.6;
 }
 
 .command-action-button:hover {
   opacity: 1;
+  color: var(--text-primary);
 }
 
-.command-action-button svg {
+/* Icons use currentColor - ensure stroke is visible (works through app-icon) */
+.command-action-button ::ng-deep svg {
   width: 14px;
   height: 14px;
-  stroke: var(--text-secondary);
-  stroke-width: 1.5;
-}
-
-.command-action-button:hover svg {
-  stroke: var(--text-primary);
+  stroke: currentColor;
 }
 
 .command-action-button::after {
